@@ -1,0 +1,108 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+
+namespace cAlgo
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class MaPyramidTrailingBot : Robot
+    {
+        [Parameter("Quantity (Lots)", Group = "Volume", DefaultValue = 1)]
+        public double Quantity { get; set; }
+
+        [Parameter("MA Type", Group = "Moving Average")]
+        public MovingAverageType MAType { get; set; }
+
+        [Parameter("Fast Periods", Group = "Moving Average", DefaultValue = 5)]
+        public int FastPeriods { get; set; }
+
+        [Parameter("Slow Periods", Group = "Moving Average", DefaultValue = 10)]
+        public int SlowPeriods { get; set; }
+
+        [Parameter("Trailing Stop (pips)", Group = "Risk", DefaultValue = 20)]
+        public double TrailingStopPips { get; set; }
+
+        [Parameter("Initial Stop Loss (pips)", Group = "Risk", DefaultValue = 30)]
+        public double InitialStopLossPips { get; set; }
+
+        private MovingAverage fastMa;
+        private MovingAverage slowMa;
+        private const string label = "HTS_MA_Pyramid";
+
+        protected override void OnStart()
+        {
+            fastMa = Indicators.MovingAverage(Bars.ClosePrices, FastPeriods, MAType);
+            slowMa = Indicators.MovingAverage(Bars.ClosePrices, SlowPeriods, MAType);
+        }
+
+        protected override void OnTick()
+        {
+            var fastNow = fastMa.Result.Last(0);
+            var fastPrev = fastMa.Result.Last(1);
+            var slowNow = slowMa.Result.Last(0);
+            var slowPrev = slowMa.Result.Last(1);
+
+            // Sprawdzenie przecięcia MA
+            if (fastPrev < slowPrev && fastNow >= slowNow)
+                EnterTrade(TradeType.Buy);
+            else if (fastPrev > slowPrev && fastNow <= slowNow)
+                EnterTrade(TradeType.Sell);
+
+            ManageTrailingStop();
+        }
+
+        private void EnterTrade(TradeType direction)
+        {
+            if (Positions.FindAll(label, SymbolName, direction).Length > 0)
+                return;
+
+            // Główna pozycja
+            ExecuteMarketOrder(direction, SymbolName, VolumeInUnits, label, InitialStopLossPips);
+
+            // Wyznaczenie SL i zleceń pyramid
+            double entryPrice = direction == TradeType.Buy ? Symbol.Bid : Symbol.Ask;
+            double slPrice = direction == TradeType.Buy ? entryPrice - InitialStopLossPips * Symbol.PipSize
+                                                        : entryPrice + InitialStopLossPips * Symbol.PipSize;
+            double totalDistance = Math.Abs(entryPrice - slPrice);
+
+            for (int i = 1; i <= 3; i++)
+            {
+                double offset = totalDistance * i / 4.0;
+                double stopPrice = direction == TradeType.Buy ? entryPrice + offset : entryPrice - offset;
+                string orderLabel = $"{label}_add_{i}";
+
+                PlaceStopOrder(direction, SymbolName, VolumeInUnits, stopPrice, orderLabel, InitialStopLossPips);
+            }
+        }
+
+        private void ManageTrailingStop()
+        {
+            var buyPositions = Positions.FindAll(label, SymbolName, TradeType.Buy);
+            var sellPositions = Positions.FindAll(label, SymbolName, TradeType.Sell);
+
+            if (buyPositions.Length > 0)
+            {
+                double newSL = Symbol.Bid - TrailingStopPips * Symbol.PipSize;
+                foreach (var position in buyPositions)
+                {
+                    if (position.StopLoss == null || newSL > position.StopLoss)
+                        ModifyPosition(position, newSL, position.TakeProfit);
+                }
+            }
+
+            if (sellPositions.Length > 0)
+            {
+                double newSL = Symbol.Ask + TrailingStopPips * Symbol.PipSize;
+                foreach (var position in sellPositions)
+                {
+                    if (position.StopLoss == null || newSL < position.StopLoss)
+                        ModifyPosition(position, newSL, position.TakeProfit);
+                }
+            }
+        }
+
+        private long VolumeInUnits => Symbol.QuantityToVolumeInUnits(Quantity);
+    }
+}
